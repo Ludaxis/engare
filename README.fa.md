@@ -68,6 +68,10 @@ sudo apt install ffmpeg
 ```bash
 engare keygen reza
 # کلید در ~/.engare/ ذخیره می‌شود
+
+# با محافظت رمز عبور:
+engare keygen reza --encrypt
+# کلید خصوصی با scrypt + AES-256-GCM رمزنگاری می‌شود
 ```
 
 <div dir="rtl">
@@ -98,6 +102,14 @@ engare encode --cover beach.mp4 --secret evidence.mp4 \
 # با ویدیو به عنوان کلید (آفلاین، تحویل فیزیکی):
 engare encode --cover beach.mp4 --secret evidence.mp4 \
   --video-key /usb/key-video.mp4 --output vacation.mkv
+
+# کدک H.264 بدون اتلاف (فایل ۲ تا ۵ برابر کوچک‌تر):
+engare encode --cover beach.mp4 --secret evidence.mp4 \
+  --password "رمز" --codec h264 --output vacation.mp4
+
+# پیش‌نمایش ظرفیت بدون رمزنگاری:
+engare encode --cover beach.mp4 --message "تست" \
+  --password "x" --output x --dry-run
 ```
 
 <div dir="rtl">
@@ -132,6 +144,17 @@ engare decode --input vacation.mkv --password "secret"
 
 <div dir="rtl">
 
+### ۶. بررسی داده پنهان
+
+</div>
+
+```bash
+engare verify --input vacation.mkv
+# بررسی وجود داده پنهان (بدون رمزگشایی)
+```
+
+<div dir="rtl">
+
 ## سه حالت کلید
 
 | حالت | نحوه کار | مناسب برای |
@@ -147,6 +170,25 @@ engare decode --input vacation.mkv --password "secret"
 - **کلیدهای یکتا فریم‌به‌فریم** — از طریق HKDF. هیچ دو فریمی کلید مشترک ندارند.
 - **X25519** — تبادل کلید منحنی بیضوی مدرن (مشابه Signal و WireGuard).
 - **کلید اشتباه = ویدیوی عادی.** بدون پیام خطا، بدون اثر، بدون مدرک.
+
+## فرمت خروجی
+
+انگاره از دو کدک بدون اتلاف پشتیبانی می‌کند:
+
+- **FFV1** (پیش‌فرض، `--codec ffv1`) — کانتینر MKV. بزرگ‌ترین فایل‌ها.
+- **H.264 بدون اتلاف** (`--codec h264`) — کانتینر MP4. با libx264rgb و CRF 0. ۲ تا ۵ برابر کوچک‌تر از FFV1.
+
+## رابط برنامه‌نویسی
+
+برای استفاده برنامه‌نویسی (رابط گرافیکی، اسکریپت):
+
+```python
+from engare.core import KeyConfig, encode_text, decode
+
+key = KeyConfig(mode="password", password="secret")
+encode_text("cover.mp4", "پیام پنهان", key, "output.mkv")
+result = decode("output.mkv", key)
+```
 
 ## مستندات
 

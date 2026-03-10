@@ -95,7 +95,7 @@ LSB steganography is the simplest form of image steganography. It is:
 
 MKV with FFV1 codec is unusual for casual video sharing. Most consumer video is H.264 in MP4. An adversary aware of steganography tools might flag MKV/FFV1 files as suspicious.
 
-**Planned mitigation:** Support lossless H.264 encoding (--crf 0) or develop a DCT-domain steganography method that survives lossy compression.
+**Mitigation (v0.2.0):** The `--codec h264` option produces standard MP4 files using libx264rgb at CRF 0 (mathematically lossless in RGB colorspace). These files are less suspicious than MKV/FFV1 and 2-5x smaller, while still preserving steganographic data exactly. Future work: DCT-domain steganography that survives lossy compression.
 
 ## Key Management Security
 
@@ -103,8 +103,9 @@ MKV with FFV1 codec is unusual for casual video sharing. Most consumer video is 
 
 - Stored in `~/.engare/<name>.key`
 - File permissions: `chmod 0o600` (owner read/write only)
-- Format: JSON with base64-encoded raw key bytes
-- **Not encrypted at rest** — planned: optional passphrase encryption of private key file
+- Format: JSON with base64-encoded key data
+- **Optional passphrase encryption:** `engare keygen <name> --encrypt` protects the private key at rest using scrypt + AES-256-GCM. The passphrase is prompted interactively when the key is loaded.
+- Unencrypted keys use type `engare-private-key-v1`; encrypted keys use type `engare-private-key-v1-encrypted` and store the ciphertext + scrypt salt instead of raw private bytes
 
 ### Public Key Verification
 

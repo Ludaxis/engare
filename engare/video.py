@@ -15,6 +15,15 @@ import numpy as np
 from PIL import Image
 
 
+def _check_ffmpeg_result(result, context: str):
+    """Check FFmpeg subprocess result and raise on failure."""
+    if result.returncode != 0:
+        stderr = result.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        raise RuntimeError(f"FFmpeg failed ({context}): {stderr[:500]}")
+
+
 def check_ffmpeg():
     """Verify FFmpeg is available."""
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
@@ -70,7 +79,7 @@ def extract_frames(path: str, outdir: str, max_frames: int | None = None) -> int
     if max_frames:
         cmd += ["-frames:v", str(max_frames)]
     cmd += ["-start_number", "0", os.path.join(outdir, "frame_%06d.png")]
-    subprocess.run(cmd, capture_output=True)
+    _check_ffmpeg_result(subprocess.run(cmd, capture_output=True), "extract_frames")
     return len([f for f in os.listdir(outdir) if f.startswith("frame_")])
 
 
@@ -113,7 +122,7 @@ def build_video(frames_dir: str, output: str, fps: float,
         ]
 
     cmd += ["-shortest", str(output)]
-    subprocess.run(cmd, capture_output=True)
+    _check_ffmpeg_result(subprocess.run(cmd, capture_output=True), "build_video")
 
 
 def read_frames(path: str) -> tuple[list[np.ndarray], dict]:
@@ -140,6 +149,9 @@ def read_frames(path: str) -> tuple[list[np.ndarray], dict]:
         frames.append(np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy())
 
     proc.wait()
+    if proc.returncode != 0:
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"FFmpeg failed (read_frames): {stderr[:500]}")
     return frames, info
 
 
@@ -178,6 +190,9 @@ def write_frames(frames: list[np.ndarray], output: str, fps: float,
         proc.stdin.write(frame.astype(np.uint8).tobytes())
     proc.stdin.close()
     proc.wait()
+    if proc.returncode != 0:
+        stderr = proc.stderr.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"FFmpeg failed (write_frames): {stderr[:500]}")
 
 
 def load_frame(path: str) -> np.ndarray:
@@ -205,7 +220,9 @@ def video_to_key(video_path: str) -> bytes:
     try:
         # Get duration
         cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path]
-        info = json.loads(subprocess.run(cmd, capture_output=True, text=True).stdout)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        _check_ffmpeg_result(result, "video_to_key ffprobe")
+        info = json.loads(result.stdout)
         duration = float(info.get("format", {}).get("duration", 1))
 
         hasher = hashlib.sha256()
@@ -213,11 +230,11 @@ def video_to_key(video_path: str) -> bytes:
         for i in range(5):
             t = duration * (i + 1) / 6
             frame_path = os.path.join(tmpdir, f"key_{i}.png")
-            subprocess.run(
+            _check_ffmpeg_result(subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(t), "-i", video_path,
                  "-frames:v", "1", "-f", "image2", frame_path],
                 capture_output=True,
-            )
+            ), f"video_to_key frame {i}")
             if os.path.exists(frame_path):
                 img = np.array(
                     Image.open(frame_path).convert("RGB").resize((64, 64), Image.LANCZOS)

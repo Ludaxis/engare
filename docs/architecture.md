@@ -8,18 +8,24 @@ Engare is a video steganography system that hides encrypted content inside norma
 ┌─────────────────────────────────────────────┐
 │  CLI Layer (cli.py)                         │
 │  User commands, argument parsing, workflow  │
+│  ASCII progress bar, --dry-run, verify      │
+├─────────────────────────────────────────────┤
+│  Core API (core.py)                         │
+│  KeyConfig, encode_text, encode_video,      │
+│  decode — clean library API for any frontend│
 ├─────────────────────────────────────────────┤
 │  Crypto Layer          │  Stego Layer       │
 │  (crypto.py)           │  (stego.py)        │
-│  Key exchange          │  LSB embedding     │
-│  Encryption            │  LSB extraction    │
-│  Key derivation        │  Capacity calc     │
+│  Key exchange          │  Vectorized LSB    │
+│  Encryption            │  embed/extract     │
+│  Key derivation        │  (numpy, 10-50x)   │
 ├────────────────────────┼────────────────────┤
 │  Key Management        │  Video I/O         │
 │  (keys.py)             │  (video.py)        │
-│  Identity generation   │  FFmpeg interface   │
-│  Key storage/loading   │  Frame extraction  │
-│  Import/export         │  Video assembly    │
+│  Identity generation   │  Pipe-based I/O    │
+│  Key storage/loading   │  read_frames()     │
+│  Import/export         │  write_frames()    │
+│  Encrypted keys        │  FFV1 + H.264      │
 │                        │  Video-to-key      │
 └────────────────────────┴────────────────────┘
 ```
@@ -36,20 +42,19 @@ Input:
 
 Process:
   1. Resolve key → 256-bit master_key
-  2. Extract cover frames as PNG (FFmpeg)
-  3. Extract secret frames as PNG (FFmpeg)
+  2. Read cover frames via pipe (read_frames → numpy arrays, no temp files)
+  3. Read secret frames via pipe (read_frames → numpy arrays)
   4. Extract cover audio as AAC (FFmpeg)
   5. For each cover frame:
      a. Derive frame_key = HKDF(master_key, frame_index)
      b. Resize matching secret frame to fit capacity
      c. Encrypt secret frame bytes with AES-256-GCM(frame_key)
      d. Build payload = MAGIC + header + encrypted_data
-     e. Embed payload in cover frame LSBs
-     f. Save stego frame as PNG
-  6. Assemble stego frames + audio into MKV (FFmpeg, FFV1 lossless)
+     e. Embed payload in cover frame LSBs (vectorized numpy)
+  6. Write stego frames + audio via pipe (write_frames, FFV1 or H.264 lossless)
 
 Output:
-  stego.mkv (looks identical to cover, contains hidden secret)
+  stego.mkv or stego.mp4 (looks identical to cover, contains hidden secret)
 ```
 
 ### Decoding (Extracting a Secret)
@@ -60,7 +65,7 @@ Input:
   key (password, video-as-key, or X25519 identity)
 
 Process:
-  1. Extract all frames as PNG (FFmpeg)
+  1. Read all frames via pipe (read_frames → numpy arrays)
   2. Probe first frame for magic bytes:
      a. "ENP1" → password mode: extract salt from bytes 4-20, derive key via scrypt(password, salt)
      b. "ENG1" → standard mode: resolve key via keypair or video-key
@@ -198,7 +203,7 @@ The decoder checks bytes 0-3 to determine the format. Data field offsets are 4 (
 
 ```
 ~/.engare/
-├── reza.key          # Private key (chmod 0600)
+├── reza.key          # Private key (chmod 0600, optionally encrypted)
 ├── reza.pub          # Public key (shareable)
 ├── ali.pub           # Imported contact public key
 └── sara.pub          # Imported contact public key
@@ -206,6 +211,7 @@ The decoder checks bytes 0-3 to determine the format. Data field offsets are 4 (
 
 ### Key File Format
 
+Unencrypted private key:
 ```json
 {
   "type": "engare-private-key-v1",
@@ -214,6 +220,19 @@ The decoder checks bytes 0-3 to determine the format. Data field offsets are 4 (
   "public": "base64-encoded-32-bytes"
 }
 ```
+
+Encrypted private key (generated with `engare keygen <name> --encrypt`):
+```json
+{
+  "type": "engare-private-key-v1-encrypted",
+  "name": "reza",
+  "encrypted_private": "base64-encoded-AES-GCM-ciphertext",
+  "salt": "base64-encoded-16-byte-scrypt-salt",
+  "public": "base64-encoded-32-bytes"
+}
+```
+
+Encryption uses scrypt to derive a key from the passphrase, then AES-256-GCM to encrypt the raw private key bytes. The passphrase is prompted interactively on load.
 
 ```json
 {
@@ -235,12 +254,15 @@ The decoder checks bytes 0-3 to determine the format. Data field offsets are 4 (
 ## Module Dependency Graph
 
 ```
-cli.py ──→ crypto.py (pure crypto, no I/O)
-  │   ──→ stego.py  (pure numpy, no crypto, no I/O)
-  │   ──→ video.py  (FFmpeg + PIL, uses hashlib for video-to-key)
-  │   ──→ keys.py   (filesystem + crypto.py)
+cli.py ──→ core.py  (library API: KeyConfig, encode_text, encode_video, decode)
+  │   ──→ crypto.py (pure crypto, no I/O)
+  │   ──→ stego.py  (pure vectorized numpy, no crypto, no I/O)
+  │   ──→ video.py  (FFmpeg pipe I/O: read_frames, write_frames, video-to-key)
+  │   ──→ keys.py   (filesystem + crypto.py, encrypted key support)
   │
   └──→ PIL, numpy, struct, os, tempfile (stdlib)
+
+core.py ──→ crypto.py, stego.py, video.py (orchestrates pipeline without CLI)
 ```
 
 `crypto.py` and `stego.py` have zero cross-dependencies — they can be tested independently without FFmpeg or filesystem access.

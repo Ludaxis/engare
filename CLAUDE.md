@@ -13,17 +13,19 @@
 ```
 engare/
 ├── engare/
-│   ├── __init__.py      # Version only
+│   ├── __init__.py      # Version only (0.3.0)
 │   ├── __main__.py      # python -m engare entry
-│   ├── cli.py           # CLI commands (keygen, keys, export, import, encode, decode, info)
-│   ├── crypto.py        # X25519 + AES-256-GCM + HKDF + scrypt (NO custom crypto)
-│   ├── stego.py         # LSB steganography engine (embed/extract bits in pixel data)
-│   ├── video.py         # FFmpeg video I/O + video-to-key derivation
-│   └── keys.py          # Key management (~/.engare/ directory, JSON key files)
+│   ├── cli.py           # CLI commands (keygen, keys, export, import, encode, decode, verify, info)
+│   ├── core.py          # Library API (v2 format, KeyConfig, encode_text, encode_video, decode) for any frontend
+│   ├── crypto.py        # X25519 + AES-256-GCM(+AAD) + HKDF + scrypt n=2^17 (NO custom crypto)
+│   ├── stego.py         # Vectorized LSB steganography engine (numpy, 10-50x faster than v0.1)
+│   ├── video.py         # FFmpeg video I/O (pipe-based read_frames/write_frames) + error propagation
+│   └── keys.py          # Key management (~/.engare/, JSON key files, optional passphrase encryption)
 ├── tests/
-│   ├── test_crypto.py       # 8 tests covering keypair, encryption, key derivation
-│   ├── test_stego.py        # 5 tests covering embed, extract, capacity, visual similarity
-│   └── test_integration.py  # Integration tests (password roundtrip, deniability, keypair, salt)
+│   ├── test_core.py         # 26 tests: v2 format, AAD, deniability, backward compat, encode/decode
+│   ├── test_crypto.py       # 9 tests: keypair, encryption, key derivation, encrypted key storage
+│   ├── test_stego.py        # 5 tests: embed, extract, capacity, visual similarity
+│   └── test_integration.py  # 6 tests: password roundtrip, deniability, keypair, salt, H.264 lossless, stego performance
 ├── docs/
 │   ├── architecture.md  # Full technical architecture
 │   ├── security.md      # Security model, threat analysis, limitations
@@ -55,39 +57,52 @@ engare/
 - **Module boundaries are strict:**
   - `crypto.py` — pure crypto, no I/O, no video, no PIL
   - `stego.py` — pure numpy pixel operations, no crypto, no I/O
-  - `video.py` — FFmpeg subprocess calls, PIL frame loading/saving, video-to-key
-  - `keys.py` — filesystem key management, uses crypto module
-  - `cli.py` — ties everything together, handles args, user-facing output
+  - `video.py` — FFmpeg subprocess calls (pipe-based I/O via `read_frames`/`write_frames`), video-to-key
+  - `keys.py` — filesystem key management, uses crypto module, supports passphrase-encrypted keys
+  - `core.py` — clean library API (`KeyConfig`, `encode_text`, `encode_video`, `decode`) for any frontend
+  - `cli.py` — ties everything together, handles args, user-facing output, ASCII progress bar
 
 ### Binary Format (Stego Payload)
 
-The payload embedded in each frame follows one of two formats depending on key mode:
+**v2 format (v0.3.0+, default):** Encrypted headers, no cleartext magic.
 
-**Keypair/Video-key mode (MAGIC = "ENG1"):**
+The header is INSIDE the AES-GCM ciphertext. Without the key, extracted LSBs are indistinguishable from random noise.
 
-Text message:
+Outer layout (keypair/video-key):
 ```
-"ENG1"(4) + type(1 byte 'T') + text_len(2 bytes BE) + enc_len(4 bytes BE) + encrypted_data
-```
-
-Video frame:
-```
-"ENG1"(4) + type(1 byte 'V') + width(2 bytes BE) + height(2 bytes BE) + total_frames(4 bytes BE) + frame_index(4 bytes BE) + enc_len(4 bytes BE) + encrypted_data
+random(4) + enc_len(4 BE) + AES-GCM(inner, frame_key, aad=frame_index)
 ```
 
-**Password mode (MAGIC = "ENP1"):**
-
-Text message:
+Outer layout (password):
 ```
-"ENP1"(4) + salt(16 bytes) + type(1 byte 'T') + text_len(2 bytes BE) + enc_len(4 bytes BE) + encrypted_data
+random(4) + salt(16) + enc_len(4 BE) + AES-GCM(inner, frame_key, aad=frame_index)
 ```
 
-Video frame:
+Inner (text):
 ```
-"ENP1"(4) + salt(16 bytes) + type(1 byte 'V') + width(2 bytes BE) + height(2 bytes BE) + total_frames(4 bytes BE) + frame_index(4 bytes BE) + enc_len(4 bytes BE) + encrypted_data
+"ENG2"(4) + version(1, 0x02) + scrypt_n_log2(1) + type(1, 'T') + text_len(2 BE) + text_data
 ```
 
-The 16-byte scrypt salt is embedded in the payload header so the decoder can derive the same key from the password. Data offset is 4 for ENG1 payloads, 20 for ENP1 payloads.
+Inner (video):
+```
+"ENG2"(4) + version(1, 0x02) + scrypt_n_log2(1) + type(1, 'V') + width(2 BE) + height(2 BE) + total_frames(4 BE) + frame_index(4 BE) + pixel_data
+```
+
+AAD = frame_index as 4 bytes big-endian. Prevents frame reordering attacks.
+
+**v1 format (legacy, decode-only):** Cleartext magic bytes at offset 0.
+
+Keypair/Video-key (MAGIC = "ENG1"):
+```
+"ENG1"(4) + type(1) + text_len(2 BE) + enc_len(4 BE) + encrypted_data
+```
+
+Password (MAGIC = "ENP1"):
+```
+"ENP1"(4) + salt(16) + type(1) + text_len(2 BE) + enc_len(4 BE) + encrypted_data
+```
+
+v1 uses scrypt n=2^14. v2 uses n=2^17 (OWASP minimum). Decoder tries v2 first, falls back to v1.
 
 Payload is zero-padded to fill the full frame capacity for consistency.
 
@@ -95,17 +110,21 @@ Payload is zero-padded to fill the full frame capacity for consistency.
 
 Three encryption key modes:
 
-1. **Password** (`--password`): scrypt key derivation with salt embedded in ENP1 payload header. Handled directly in `cmd_encode()`/`cmd_decode()`.
+1. **Password** (`--password`): scrypt key derivation (n=2^17). `--password` (no value) prompts securely via getpass. `ENGARE_PASSWORD` env var for scripting. `--password VALUE` emits deprecation warning (visible in ps aux).
 2. **Video-as-key** (`--video-key`): SHA-256 hash of 5 sampled frames + first 1MB. Physical USB handoff. Resolved via `_resolve_key()`.
 3. **Key pair** (`--identity` + `--recipient`/`--sender`): X25519 ECDH shared secret via HKDF. Most secure. Resolved via `_resolve_key()`.
 
 ### Key Storage
 
 Keys are stored in `~/.engare/`:
-- `<name>.key` — Private key (JSON, chmod 0o600)
+- `<name>.key` — Private key (JSON, chmod 0o600). Optionally encrypted with passphrase.
 - `<name>.pub` — Public key (JSON, shareable)
 
-Format: `{"type": "engare-private-key-v1", "name": "...", "private": "base64...", "public": "base64..."}`
+Unencrypted format: `{"type": "engare-private-key-v1", "name": "...", "private": "base64...", "public": "base64..."}`
+
+Encrypted format: `{"type": "engare-private-key-v1-encrypted", "name": "...", "encrypted_private": "base64...", "salt": "base64...", "public": "base64..."}`
+
+Encrypted keys use scrypt + AES-256-GCM. The passphrase is required to load the key (prompted interactively if not provided). Generate with `engare keygen <name> --encrypt`.
 
 ### Testing
 
@@ -118,9 +137,11 @@ All tests must pass before any merge. Tests do NOT require FFmpeg (crypto and st
 
 ### Output Format
 
-- Output is always **MKV with FFV1 lossless codec, rgb24 pixel format**
-- This preserves every bit exactly — required for LSB steganography to survive
-- H.264, VP9, or any lossy codec will **destroy** the hidden data
+- Two lossless codec options, both rgb24 pixel format:
+  - **FFV1** (default, `--codec ffv1`) — MKV container, largest files
+  - **H.264 lossless** (`--codec h264`) — MP4 container, libx264rgb at CRF 0, 2-5x smaller than FFV1
+- Both preserve every bit exactly — required for LSB steganography to survive
+- Standard (lossy) H.264, VP9, or any lossy codec will **destroy** the hidden data
 - Audio is re-encoded as AAC 128kbps from the cover video
 
 ## Roadmap (Planned Features)
@@ -149,9 +170,9 @@ All tests must pass before any merge. Tests do NOT require FFmpeg (crypto and st
 ## Known Limitations
 
 1. **LSB is detectable** by statistical analysis (StegDetect, RS Analysis). The data is encrypted, but an adversary can detect that *something* is hidden.
-2. **Lossy compression destroys data.** Sharing via social media (which re-encodes to H.264) will destroy the hidden content. Files must be shared directly (email attachment, file transfer, USB).
+2. **Lossy compression destroys data.** Sharing via social media (which re-encodes with lossy H.264) will destroy the hidden content. Files must be shared directly (email attachment, file transfer, USB).
 3. **No forward secrecy.** If a long-term key is compromised, all past messages are compromised. Planned fix: ephemeral keys per message.
-4. **Large file sizes.** FFV1 lossless MKV files are significantly larger than H.264 MP4. A 30-second 720p cover video can be 500MB+.
+4. **Large file sizes.** FFV1 lossless MKV files are significantly larger than lossy MP4. The `--codec h264` option (lossless H.264) reduces output size 2-5x while preserving steganographic data.
 
 ## Agent Organization
 

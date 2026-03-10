@@ -52,6 +52,10 @@ sudo apt install ffmpeg
 engare keygen reza
 # Creates key pair in ~/.engare/
 # Share the public key with anyone you want to communicate with
+
+# Or with passphrase protection:
+engare keygen reza --encrypt
+# Private key is encrypted at rest (scrypt + AES-256-GCM)
 ```
 
 ### 2. Import a Friend's Public Key
@@ -74,6 +78,14 @@ engare encode --cover beach.mp4 --secret evidence.mp4 \
 # Using video-as-key (offline, physical handoff):
 engare encode --cover beach.mp4 --secret evidence.mp4 \
   --video-key /usb/our-key-video.mp4 --output vacation.mkv
+
+# H.264 lossless codec (2-5x smaller files):
+engare encode --cover beach.mp4 --secret evidence.mp4 \
+  --password "shared-secret" --codec h264 --output vacation.mp4
+
+# Preview capacity without encoding:
+engare encode --cover beach.mp4 --message "test" \
+  --password "x" --output x --dry-run
 ```
 
 ### 4. Extract the Secret
@@ -102,6 +114,13 @@ engare decode --input vacation.mkv --password "secret"
 # Output: Message: meet at 8pm tomorrow
 ```
 
+### 6. Verify Hidden Data
+
+```bash
+engare verify --input vacation.mkv
+# Checks if a video contains hidden data (without decrypting)
+```
+
 ## Three Key Modes
 
 | Mode | How It Works | Best For |
@@ -128,7 +147,25 @@ Shows how much secret data fits inside your cover video.
 
 ## Output Format
 
-Engare outputs **MKV files with FFV1 lossless codec**. This preserves every pixel exactly. Lossy compression (H.264, VP9) destroys hidden data.
+Engare supports two lossless codecs:
+
+- **FFV1** (default, `--codec ffv1`) — MKV container. Largest files but universally lossless.
+- **H.264 lossless** (`--codec h264`) — MP4 container. Uses libx264rgb at CRF 0 for mathematically lossless RGB encoding. 2-5x smaller than FFV1.
+
+Both preserve every pixel exactly. Lossy compression (standard H.264, VP9) destroys hidden data.
+
+## Library API
+
+For programmatic use (GUIs, scripts, other frontends), import `engare.core`:
+
+```python
+from engare.core import KeyConfig, encode_text, encode_video, decode
+
+key = KeyConfig(mode="password", password="secret")
+encode_text("cover.mp4", "hidden message", key, "output.mkv")
+result = decode("output.mkv", key)
+print(result.message)  # "hidden message"
+```
 
 ## Documentation
 

@@ -26,17 +26,23 @@ sudo apt install ffmpeg
 python -m pytest tests/ -v
 ```
 
-All tests must pass before submitting a PR. The crypto and stego tests do not require FFmpeg.
+16 tests must pass before submitting a PR. The crypto and stego tests do not require FFmpeg. Integration tests that require FFmpeg are skipped automatically if FFmpeg is not installed.
+
+Test coverage includes:
+- **Crypto** (9 tests): keypair generation, shared key derivation, encrypt/decrypt, wrong key rejection, tamper detection, password-to-key, per-frame key derivation, end-to-end keypair flow, encrypted key storage
+- **Stego** (5 tests): capacity calculation, embed/extract roundtrip, shape preservation, visual similarity, overflow handling
+- **Integration** (6 tests): password text roundtrip, wrong-password deniability, keypair text roundtrip, salt embedding, H.264 lossless roundtrip, stego performance benchmarks
 
 ## Project Structure
 
 | File | Responsibility | Dependencies |
 |------|---------------|-------------|
 | `engare/crypto.py` | Pure cryptography (X25519, AES-GCM, HKDF, scrypt) | `cryptography` only |
-| `engare/stego.py` | Pure steganography (LSB embed/extract) | `numpy` only |
-| `engare/video.py` | Video I/O via FFmpeg, video-to-key | `PIL`, `numpy`, FFmpeg |
-| `engare/keys.py` | Key file management | `engare/crypto.py` |
-| `engare/cli.py` | CLI commands, ties everything together | All modules |
+| `engare/stego.py` | Vectorized LSB steganography (embed/extract, 10-50x faster) | `numpy` only |
+| `engare/video.py` | Pipe-based video I/O (`read_frames`/`write_frames`), video-to-key | `PIL`, `numpy`, FFmpeg |
+| `engare/keys.py` | Key file management, encrypted key storage | `engare/crypto.py` |
+| `engare/core.py` | Library API (`KeyConfig`, `encode_text`, `encode_video`, `decode`) | `crypto`, `stego`, `video` |
+| `engare/cli.py` | CLI commands (encode, decode, verify, keygen, info), progress bar | All modules |
 
 ## Rules
 
@@ -63,11 +69,18 @@ docs: add Persian translation of README
 test: add integration test for video-as-key mode
 ```
 
+### Test Patterns
+
+When adding new features, follow these test patterns:
+- **Crypto tests** (`test_crypto.py`): Pure unit tests, no I/O or FFmpeg. See `test_encrypted_key_storage` for testing key management with monkey-patched key directories.
+- **Stego tests** (`test_stego.py`): Random numpy arrays as frames, test roundtrip and edge cases. See `TestStegoPerformance` for performance benchmarks.
+- **Integration tests** (`test_integration.py`): Use `@needs_ffmpeg` decorator for tests requiring FFmpeg. Use `make_test_video()` helper for synthetic test videos. See `TestH264LosslessRoundtrip` for codec-specific testing.
+
 ## Areas Where Help Is Needed
 
-- **DCT-domain steganography** — hiding data that survives H.264 compression
+- **DCT-domain steganography** — hiding data that survives lossy H.264 compression
 - **Steganalysis testing** — running detection tools against Engare output
-- **Desktop app** — Tauri (Rust + web) cross-platform GUI
+- **Desktop app** — Tauri (Rust + web) cross-platform GUI (can use `engare.core` API)
 - **Mobile app** — React Native or Flutter with FFmpeg integration
 - **Persian/Arabic documentation** — translations for target users
 - **Multi-recipient encoding** — different hidden content for different keys

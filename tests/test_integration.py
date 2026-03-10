@@ -13,7 +13,7 @@ import pytest
 from PIL import Image
 
 from engare import crypto, stego
-from engare.cli import MAGIC, MAGIC_PWD
+from engare.core import MAGIC, MAGIC_PWD
 
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None

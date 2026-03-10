@@ -23,6 +23,7 @@ import numpy as np
 from PIL import Image
 
 from . import crypto, stego, video, keys
+from .core import MAGIC, MAGIC_PWD
 
 
 def _progress_bar(current, total, width=30):
@@ -34,10 +35,6 @@ def _progress_bar(current, total, width=30):
     if current >= total:
         sys.stderr.write("\n")
     sys.stderr.flush()
-
-
-MAGIC = b"ENG1"      # Engare v1 format marker (keypair / video-key modes)
-MAGIC_PWD = b"ENP1"  # Engare v1 password mode (salt embedded in header)
 
 
 def cmd_keygen(args):
@@ -97,8 +94,9 @@ def cmd_encode(args):
 
     # Determine encryption key and salt
     salt = None
-    if hasattr(args, "password") and args.password:
-        master_key, salt = crypto.password_to_key(args.password)
+    password = _resolve_password(args)
+    if password:
+        master_key, salt = crypto.password_to_key(password)
     else:
         master_key = _resolve_key(args)
 
@@ -152,10 +150,14 @@ def cmd_encode(args):
         audio_path = os.path.join(tmpdir, "audio.aac")
         has_audio = video.extract_audio(args.cover, audio_path)
 
-        if args.message:
-            _encode_text(args, master_key, salt, cover_frames, cap, audio_path, has_audio, cover_info)
-        elif args.secret:
-            _encode_video(args, master_key, salt, cover_frames, cap, audio_path, has_audio, cover_info)
+        try:
+            if args.message:
+                _encode_text(args, master_key, salt, cover_frames, cap, audio_path, has_audio, cover_info)
+            elif args.secret:
+                _encode_video(args, master_key, salt, cover_frames, cap, audio_path, has_audio, cover_info)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -182,11 +184,13 @@ def _encode_text(args, master_key, salt, cover_frames, cap, audio_path, has_audi
         header = magic_header + struct.pack(">BH", ord("T"), len(secret_data))
         payload = header + struct.pack(">I", len(encrypted)) + encrypted
 
-        if len(payload) <= cap:
-            payload += b"\x00" * (cap - len(payload))
-            stego_frames.append(stego.embed(cover_img, payload))
-        else:
-            stego_frames.append(cover_img)
+        if len(payload) > cap:
+            raise ValueError(
+                f"Message too large: payload {len(payload)} bytes exceeds "
+                f"frame capacity {cap} bytes"
+            )
+        payload += b"\x00" * (cap - len(payload))
+        stego_frames.append(stego.embed(cover_img, payload))
 
         _progress_bar(ci + 1, num_cover)
 
@@ -245,11 +249,13 @@ def _encode_video(args, master_key, salt, cover_frames, cap, audio_path, has_aud
         header = magic_header + struct.pack(">BHHII", ord("V"), sw, sh, num_secret, si)
         payload = header + struct.pack(">I", len(encrypted)) + encrypted
 
-        if len(payload) <= cap:
-            payload += b"\x00" * (cap - len(payload))
-            stego_frames.append(stego.embed(cover_img, payload))
-        else:
-            stego_frames.append(cover_img)
+        if len(payload) > cap:
+            raise ValueError(
+                f"Secret video payload too large: {len(payload)} bytes exceeds "
+                f"frame capacity {cap} bytes"
+            )
+        payload += b"\x00" * (cap - len(payload))
+        stego_frames.append(stego.embed(cover_img, payload))
 
         _progress_bar(ci + 1, num_cover)
 
@@ -283,13 +289,14 @@ def cmd_decode(args):
             break
 
     if key_mode == "pwd":
-        if not (hasattr(args, "password") and args.password):
+        password = _resolve_password(args)
+        if not password:
             if args.output:
                 shutil.copy2(args.input, args.output)
             print(f"Video saved: {args.output or args.input}")
             return
         embedded_salt = probe[4:20]
-        master_key, _ = crypto.password_to_key(args.password, embedded_salt)
+        master_key, _ = crypto.password_to_key(password, embedded_salt)
     elif key_mode == "std":
         master_key = _resolve_key(args)
     else:
@@ -433,6 +440,28 @@ def cmd_verify(args):
         print(f"  (This could mean no data, or you need the right key to check)")
 
 
+def _resolve_password(args) -> str | None:
+    """Resolve password from args, env var, or interactive prompt."""
+    pw = getattr(args, "password", None)
+    if pw is None:
+        return None
+    if pw is True:
+        # --password with no value: check env, then prompt
+        env_pw = os.environ.get("ENGARE_PASSWORD")
+        if env_pw:
+            return env_pw
+        import getpass
+        return getpass.getpass("Password: ")
+    # --password VALUE on CLI (visible in ps aux)
+    import warnings
+    warnings.warn(
+        "Passing password on command line is insecure (visible in ps aux). "
+        "Use --password (no value) to prompt securely, or set ENGARE_PASSWORD env var.",
+        stacklevel=2,
+    )
+    return pw
+
+
 def _resolve_key(args) -> bytes:
     """Resolve encryption key from CLI arguments (non-password modes)."""
     if hasattr(args, "video_key") and args.video_key:
@@ -522,7 +551,8 @@ Examples:
                      help="Codec: ffv1 (lossless, large) or h264 (lossless RGB, 2-5x smaller)")
     enc.add_argument("--dry-run", action="store_true",
                      help="Show capacity analysis without encoding")
-    enc.add_argument("--password", help="Encrypt with password")
+    enc.add_argument("--password", nargs="?", const=True, default=None,
+                     help="Encrypt with password (omit value to prompt securely)")
     enc.add_argument("--video-key", help="Use a video file as encryption key")
     enc.add_argument("--identity", help="Your identity name (for key pair mode)")
     enc.add_argument("--recipient", help="Recipient identity name (for key pair mode)")
@@ -531,7 +561,8 @@ Examples:
     dec = sub.add_parser("decode", help="Extract hidden content from a video")
     dec.add_argument("--input", required=True, help="Stego video file")
     dec.add_argument("--output", help="Output file")
-    dec.add_argument("--password", help="Decrypt with password")
+    dec.add_argument("--password", nargs="?", const=True, default=None,
+                     help="Decrypt with password (omit value to prompt securely)")
     dec.add_argument("--video-key", help="Video file used as key")
     dec.add_argument("--identity", help="Your identity name (for key pair mode)")
     dec.add_argument("--sender", help="Sender identity name (for key pair mode)")

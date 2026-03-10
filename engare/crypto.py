@@ -50,41 +50,48 @@ def derive_shared_key(
 
 # ── Password-Based Key Derivation ──
 
-def password_to_key(password: str, salt: bytes | None = None) -> tuple[bytes, bytes]:
+def password_to_key(password: str, salt: bytes | None = None,
+                    n: int = 2**17) -> tuple[bytes, bytes]:
     """
     Derive a 256-bit key from a password using scrypt.
     Returns (key, salt). Store salt with the ciphertext.
+
+    n: scrypt CPU/memory cost parameter. Default 2^17 (OWASP minimum).
+       Use n=2**14 for backward compat with v1 payloads.
     """
     if salt is None:
         salt = os.urandom(16)
-    kdf = Scrypt(salt=salt, length=32, n=2**14, r=8, p=1)
+    kdf = Scrypt(salt=salt, length=32, n=n, r=8, p=1)
     key = kdf.derive(password.encode("utf-8"))
     return key, salt
 
 
 # ── Authenticated Encryption ──
 
-def encrypt(data: bytes, key: bytes) -> bytes:
+def encrypt(data: bytes, key: bytes, aad: bytes | None = None) -> bytes:
     """
     AES-256-GCM authenticated encryption.
     Returns: nonce (12 bytes) + ciphertext + tag (16 bytes).
     Tamper-proof: any modification is detected on decryption.
+
+    aad: optional additional authenticated data (e.g. frame index).
+    AAD is authenticated but NOT encrypted — used to bind ciphertext to context.
     """
     nonce = os.urandom(12)
     aesgcm = AESGCM(key)
-    ciphertext = aesgcm.encrypt(nonce, data, None)
+    ciphertext = aesgcm.encrypt(nonce, data, aad)
     return nonce + ciphertext
 
 
-def decrypt(data: bytes, key: bytes) -> bytes:
+def decrypt(data: bytes, key: bytes, aad: bytes | None = None) -> bytes:
     """
     AES-256-GCM authenticated decryption.
-    Raises InvalidTag if key is wrong or data was tampered with.
+    Raises InvalidTag if key is wrong, data was tampered with, or AAD doesn't match.
     """
     nonce = data[:12]
     ciphertext = data[12:]
     aesgcm = AESGCM(key)
-    return aesgcm.decrypt(nonce, ciphertext, None)
+    return aesgcm.decrypt(nonce, ciphertext, aad)
 
 
 # ── Per-Frame Key Derivation ──
