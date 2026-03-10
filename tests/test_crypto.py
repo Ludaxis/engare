@@ -93,3 +93,47 @@ def test_end_to_end_keypair():
     decrypted = crypto.decrypt(ciphertext, shared_key_bob)
 
     assert decrypted == plaintext
+
+
+def test_encrypted_key_storage():
+    """Private key encrypted at rest with passphrase."""
+    import tempfile, json
+    from engare import keys
+
+    tmpdir = tempfile.mkdtemp(prefix="engare_test_keys_")
+    original_func = keys.get_key_dir
+
+    try:
+        # Monkey-patch key dir to temp
+        from pathlib import Path
+        keys.get_key_dir = lambda: Path(tmpdir)
+
+        # Generate with passphrase
+        result = keys.generate_identity("test-enc", passphrase="my-secret")
+        assert result["encrypted"] is True
+
+        # Verify key file is encrypted
+        key_data = json.loads(Path(result["private_path"]).read_text())
+        assert key_data["type"] == "engare-private-key-v1-encrypted"
+        assert "encrypted_private" in key_data
+        assert "private" not in key_data  # Raw private key NOT stored
+
+        # Load with correct passphrase
+        priv = keys.load_private_key("test-enc", passphrase="my-secret")
+        assert priv is not None
+
+        # Load with wrong passphrase
+        with pytest.raises(ValueError, match="Wrong passphrase"):
+            keys.load_private_key("test-enc", passphrase="wrong")
+
+        # Generate without passphrase (backward compatible)
+        result2 = keys.generate_identity("test-plain")
+        assert result2["encrypted"] is False
+        key_data2 = json.loads(Path(result2["private_path"]).read_text())
+        assert key_data2["type"] == "engare-private-key-v1"
+        assert "private" in key_data2
+
+    finally:
+        keys.get_key_dir = original_func
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)

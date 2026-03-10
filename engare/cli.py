@@ -8,6 +8,7 @@ Commands:
   engare import <name> <key>       Import someone's public key
   engare encode                    Hide a secret video inside a cover video
   engare decode                    Extract a secret video from a stego video
+  engare verify                    Check if a video contains hidden data
   engare info                      Show capacity analysis
 """
 
@@ -24,14 +25,35 @@ from PIL import Image
 from . import crypto, stego, video, keys
 
 
+def _progress_bar(current, total, width=30):
+    """Print an ASCII progress bar to stderr."""
+    pct = current / total if total else 1
+    filled = int(width * pct)
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    sys.stderr.write(f"\r  [{bar}] {pct*100:5.1f}% ({current}/{total} frames)")
+    if current >= total:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
 MAGIC = b"ENG1"      # Engare v1 format marker (keypair / video-key modes)
 MAGIC_PWD = b"ENP1"  # Engare v1 password mode (salt embedded in header)
 
 
 def cmd_keygen(args):
     """Generate a new identity."""
-    result = keys.generate_identity(args.name)
+    passphrase = getattr(args, "passphrase", None)
+    if passphrase is None and getattr(args, "encrypt", False):
+        import getpass
+        passphrase = getpass.getpass("Passphrase to protect private key: ")
+        confirm = getpass.getpass("Confirm passphrase: ")
+        if passphrase != confirm:
+            print("Error: passphrases do not match")
+            sys.exit(1)
+    result = keys.generate_identity(args.name, passphrase=passphrase)
     print(f"Identity created: {args.name}")
+    if result.get("encrypted"):
+        print(f"  Protected: passphrase-encrypted")
     print(f"  Fingerprint: {result['fingerprint']}")
     print(f"  Private key: {result['private_path']}")
     print(f"  Public key:  {result['public_path']}")
@@ -47,7 +69,8 @@ def cmd_keys(args):
         print("No identities yet. Create one with: engare keygen <name>")
         return
     for ident in identities:
-        print(f"  {ident['name']}")
+        enc_mark = " [encrypted]" if ident.get("encrypted") else ""
+        print(f"  {ident['name']}{enc_mark}")
         print(f"    Fingerprint: {ident['fingerprint']}")
         print(f"    Public key:  {ident['public_key']}")
         print()
@@ -87,6 +110,41 @@ def cmd_encode(args):
 
     print(f"Cover:    {cover_info['width']}x{cover_info['height']} @ {cover_info['fps']:.1f}fps, {num_cover} frames")
     print(f"Capacity: {cap:,} bytes/frame ({cap/1024:.1f} KB)")
+    print(f"Codec:    {getattr(args, 'codec', 'ffv1')}")
+
+    # Dry-run: show analysis and exit
+    if getattr(args, "dry_run", False):
+        if args.message:
+            msg_bytes = len(args.message.encode("utf-8"))
+            enc_overhead = 28  # AES-GCM nonce(12) + tag(16)
+            header_size = (20 if salt else 4) + 7  # magic + type + text_len + enc_len
+            total = header_size + msg_bytes + enc_overhead
+            print(f"\nDry run:")
+            print(f"  Message:   {msg_bytes} bytes")
+            print(f"  Payload:   {total} bytes/frame")
+            print(f"  Fits:      {'yes' if total <= cap else 'NO -- message too large'}")
+        elif args.secret:
+            secret_info = video.get_info(args.secret)
+            print(f"\nDry run:")
+            print(f"  Secret: {secret_info['width']}x{secret_info['height']} @ {secret_info['fps']:.1f}fps")
+            extra = 16 if salt else 0
+            overhead = 49 + extra
+            available = cap - overhead
+            aspect = secret_info["width"] / secret_info["height"]
+            sh = int((available / 3 / aspect) ** 0.5)
+            sw = int(sh * aspect)
+            sw = min(sw, 240) & ~1
+            sh = min(sh, 180) & ~1
+            if sw < 16 or sh < 16:
+                print(f"  Fits:   NO -- cover too small")
+            else:
+                print(f"  Resized to: {sw}x{sh}")
+                print(f"  Fits:   yes ({sw*sh*3:,} bytes/frame)")
+        return
+
+    if not args.message and not args.secret:
+        print("Error: provide --message or --secret")
+        sys.exit(1)
 
     # Extract audio to temp file (still needed for muxing)
     tmpdir = tempfile.mkdtemp(prefix="engare_")
@@ -98,9 +156,6 @@ def cmd_encode(args):
             _encode_text(args, master_key, salt, cover_frames, cap, audio_path, has_audio, cover_info)
         elif args.secret:
             _encode_video(args, master_key, salt, cover_frames, cap, audio_path, has_audio, cover_info)
-        else:
-            print("Error: provide --message or --secret")
-            sys.exit(1)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -133,8 +188,7 @@ def _encode_text(args, master_key, salt, cover_frames, cap, audio_path, has_audi
         else:
             stego_frames.append(cover_img)
 
-        if (ci + 1) % 30 == 0 or ci == num_cover - 1:
-            print(f"  [{(ci+1)/num_cover*100:5.1f}%]")
+        _progress_bar(ci + 1, num_cover)
 
     codec = getattr(args, "codec", "ffv1")
     video.write_frames(stego_frames, args.output, cover_info["fps"],
@@ -197,8 +251,7 @@ def _encode_video(args, master_key, salt, cover_frames, cap, audio_path, has_aud
         else:
             stego_frames.append(cover_img)
 
-        if (ci + 1) % 30 == 0 or ci == num_cover - 1:
-            print(f"  [{(ci+1)/num_cover*100:5.1f}%]")
+        _progress_bar(ci + 1, num_cover)
 
     codec = getattr(args, "codec", "ffv1")
     video.write_frames(stego_frames, args.output, cover_info["fps"],
@@ -338,6 +391,48 @@ def cmd_info(args):
         print(f"  {label}: {w}x{h}")
 
 
+def cmd_verify(args):
+    """Check if a video contains intact hidden data (without decrypting)."""
+    frames, info = video.read_frames(args.input)
+    num = len(frames)
+    cap = stego.capacity(info["width"], info["height"])
+
+    print("Engare - VERIFY")
+    print("=" * 50)
+    print(f"Input:  {info['width']}x{info['height']} @ {info['fps']:.1f}fps, {num} frames")
+
+    detected = 0
+    content_type = None
+    magic_type = None
+
+    for fi in range(num):
+        payload = stego.extract(frames[fi], cap)
+        if payload[:4] == MAGIC_PWD:
+            magic_type = "ENP1 (password)"
+            data_offset = 20
+        elif payload[:4] == MAGIC:
+            magic_type = "ENG1 (keypair/video-key)"
+            data_offset = 4
+        else:
+            continue
+
+        stype = chr(payload[data_offset])
+        if stype == "T":
+            content_type = "text"
+        elif stype == "V":
+            content_type = "video"
+        detected += 1
+
+    if detected > 0:
+        print(f"Status: Hidden data detected")
+        print(f"  Format:  {magic_type}")
+        print(f"  Type:    {content_type}")
+        print(f"  Frames:  {detected}/{num} contain data")
+    else:
+        print(f"Status: No hidden data detected")
+        print(f"  (This could mean no data, or you need the right key to check)")
+
+
 def _resolve_key(args) -> bytes:
     """Resolve encryption key from CLI arguments (non-password modes)."""
     if hasattr(args, "video_key") and args.video_key:
@@ -371,26 +466,26 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate your identity:
-  engare keygen reza
+  # Generate your identity (with passphrase protection):
+  engare keygen reza --encrypt
 
   # Import a friend's public key:
   engare import ali "base64-public-key-here"
 
-  # Hide a message (password):
-  engare encode --cover beach.mp4 --message "meet at 8pm" --password "secret" --output vacation.mkv
+  # Hide a message (password, smaller MP4 output):
+  engare encode --cover beach.mp4 --message "meet at 8pm" --password "secret" --codec h264 --output vacation.mp4
+
+  # Preview capacity without encoding:
+  engare encode --cover beach.mp4 --message "test" --password "x" --output x --dry-run
 
   # Hide a video (key pair):
   engare encode --cover beach.mp4 --secret evidence.mp4 --identity reza --recipient ali --output vacation.mkv
 
-  # Hide a video (video-as-key on USB):
-  engare encode --cover beach.mp4 --secret evidence.mp4 --video-key /usb/face.mp4 --output vacation.mkv
-
   # Extract (password):
-  engare decode --input vacation.mkv --password "secret" --output result.mkv
+  engare decode --input vacation.mp4 --password "secret" --output result.mkv
 
-  # Extract (key pair):
-  engare decode --input vacation.mkv --identity ali --sender reza --output result.mkv
+  # Check if a video has hidden data:
+  engare verify --input vacation.mp4
 
   # Check capacity:
   engare info --cover beach.mp4
@@ -402,6 +497,8 @@ Examples:
     # keygen
     kg = sub.add_parser("keygen", help="Generate a new identity (key pair)")
     kg.add_argument("name", help="Identity name")
+    kg.add_argument("--encrypt", action="store_true",
+                     help="Protect private key with a passphrase")
 
     # keys
     sub.add_parser("keys", help="List all identities")
@@ -423,6 +520,8 @@ Examples:
     enc.add_argument("--output", required=True, help="Output file")
     enc.add_argument("--codec", choices=["ffv1", "h264"], default="ffv1",
                      help="Codec: ffv1 (lossless, large) or h264 (lossless RGB, 2-5x smaller)")
+    enc.add_argument("--dry-run", action="store_true",
+                     help="Show capacity analysis without encoding")
     enc.add_argument("--password", help="Encrypt with password")
     enc.add_argument("--video-key", help="Use a video file as encryption key")
     enc.add_argument("--identity", help="Your identity name (for key pair mode)")
@@ -437,6 +536,10 @@ Examples:
     dec.add_argument("--identity", help="Your identity name (for key pair mode)")
     dec.add_argument("--sender", help="Sender identity name (for key pair mode)")
 
+    # verify
+    ver = sub.add_parser("verify", help="Check if a video contains hidden data")
+    ver.add_argument("--input", required=True, help="Video file to check")
+
     # info
     inf = sub.add_parser("info", help="Show video capacity analysis")
     inf.add_argument("--cover", required=True, help="Cover video file")
@@ -450,6 +553,7 @@ Examples:
         "import": cmd_import,
         "encode": cmd_encode,
         "decode": cmd_decode,
+        "verify": cmd_verify,
         "info": cmd_info,
     }
 
