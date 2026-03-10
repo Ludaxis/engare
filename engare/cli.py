@@ -24,7 +24,8 @@ from PIL import Image
 from . import crypto, stego, video, keys
 
 
-MAGIC = b"ENG1"  # Engare v1 format marker
+MAGIC = b"ENG1"      # Engare v1 format marker (keypair / video-key modes)
+MAGIC_PWD = b"ENP1"  # Engare v1 password mode (salt embedded in header)
 
 
 def cmd_keygen(args):
@@ -71,8 +72,12 @@ def cmd_encode(args):
     print("Engare - ENCODE")
     print("=" * 50)
 
-    # Determine encryption key
-    master_key = _resolve_key(args)
+    # Determine encryption key and salt
+    salt = None
+    if hasattr(args, "password") and args.password:
+        master_key, salt = crypto.password_to_key(args.password)
+    else:
+        master_key = _resolve_key(args)
 
     cover_info = video.get_info(args.cover)
     cap = stego.capacity(cover_info["width"], cover_info["height"])
@@ -93,9 +98,9 @@ def cmd_encode(args):
         has_audio = video.extract_audio(args.cover, audio_path)
 
         if args.message:
-            _encode_text(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info)
+            _encode_text(args, master_key, salt, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info)
         elif args.secret:
-            _encode_video(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info)
+            _encode_video(args, master_key, salt, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info)
         else:
             print("Error: provide --message or --secret")
             sys.exit(1)
@@ -104,13 +109,19 @@ def cmd_encode(args):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _encode_text(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info):
+def _encode_text(args, master_key, salt, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info):
     """Encode a text message (embedded in every frame for redundancy)."""
     secret_data = args.message.encode("utf-8")
     print(f"Message:  {len(secret_data)} bytes")
 
     stego_dir = os.path.join(tmpdir, "stego")
     os.makedirs(stego_dir)
+
+    # Build magic + optional salt prefix
+    if salt is not None:
+        magic_header = MAGIC_PWD + salt  # "ENP1" + 16 bytes salt
+    else:
+        magic_header = MAGIC              # "ENG1"
 
     print(f"Encoding {num_cover} frames...")
     for ci in range(num_cover):
@@ -122,8 +133,8 @@ def _encode_text(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_path
         frame_key = crypto.derive_frame_key(master_key, ci)
         encrypted = crypto.encrypt(secret_data, frame_key)
 
-        # Header: MAGIC(4) + type(1) + text_len(2) + enc_len(4) = 11 bytes
-        header = struct.pack(">4sBH", MAGIC, ord("T"), len(secret_data))
+        # Header: magic_header + type(1) + text_len(2) + enc_len(4)
+        header = magic_header + struct.pack(">BH", ord("T"), len(secret_data))
         payload = header + struct.pack(">I", len(encrypted)) + encrypted
 
         out_path = os.path.join(stego_dir, f"frame_{ci:06d}.png")
@@ -143,7 +154,7 @@ def _encode_text(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_path
         print(f"Done: {args.output} ({size_mb:.1f} MB)")
 
 
-def _encode_video(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info):
+def _encode_video(args, master_key, salt, cover_dir, num_cover, cap, tmpdir, audio_path, has_audio, cover_info):
     """Encode a secret video inside the cover video."""
     secret_info = video.get_info(args.secret)
     print(f"Secret:   {secret_info['width']}x{secret_info['height']} @ {secret_info['fps']:.1f}fps")
@@ -153,9 +164,17 @@ def _encode_video(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_pat
     num_secret = video.extract_frames(args.secret, sec_dir)
     print(f"  {num_secret} frames")
 
+    # Build magic + optional salt prefix
+    if salt is not None:
+        magic_header = MAGIC_PWD + salt  # "ENP1" + 16 bytes salt
+        extra_overhead = 16
+    else:
+        magic_header = MAGIC              # "ENG1"
+        extra_overhead = 0
+
     # Calculate max secret resolution that fits in capacity
-    # Reserve space for header(17) + enc_len(4) + AES overhead(28)
-    overhead = 49
+    # Reserve space for header(17+extra) + enc_len(4) + AES overhead(28)
+    overhead = 49 + extra_overhead
     available = cap - overhead
     aspect = secret_info["width"] / secret_info["height"]
     sh = int((available / 3 / aspect) ** 0.5)
@@ -191,8 +210,8 @@ def _encode_video(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_pat
             frame_key = crypto.derive_frame_key(master_key, ci)
             encrypted = crypto.encrypt(sec_bytes, frame_key)
 
-            # Header: MAGIC(4) + type(1) + width(2) + height(2) + total(4) + index(4) = 17 bytes
-            header = struct.pack(">4sBHHII", MAGIC, ord("V"), sw, sh, num_secret, si)
+            # Header: magic_header + type(1) + width(2) + height(2) + total(4) + index(4)
+            header = magic_header + struct.pack(">BHHII", ord("V"), sw, sh, num_secret, si)
             payload = header + struct.pack(">I", len(encrypted)) + encrypted
 
             if len(payload) <= cap:
@@ -215,8 +234,6 @@ def _encode_video(args, master_key, cover_dir, num_cover, cap, tmpdir, audio_pat
 
 def cmd_decode(args):
     """Extract hidden content from a stego video."""
-    master_key = _resolve_key(args)
-
     info = video.get_info(args.input)
     cap = stego.capacity(info["width"], info["height"])
 
@@ -224,6 +241,42 @@ def cmd_decode(args):
     try:
         frames_dir = os.path.join(tmpdir, "frames")
         num = video.extract_frames(args.input, frames_dir)
+
+        # Probe first frame to detect key mode and derive master key
+        master_key = None
+        key_mode = None  # "pwd" or "std"
+
+        for fi in range(num):
+            ff = os.path.join(frames_dir, f"frame_{fi:06d}.png")
+            if not os.path.exists(ff):
+                continue
+            img = video.load_frame(ff)
+            probe = stego.extract(img, cap)
+            if probe[:4] == MAGIC_PWD:
+                key_mode = "pwd"
+                break
+            elif probe[:4] == MAGIC:
+                key_mode = "std"
+                break
+
+        if key_mode == "pwd":
+            # Password mode — extract salt from header, derive key
+            if not (hasattr(args, "password") and args.password):
+                # No password given, can't decode — output normal video (deniability)
+                if args.output:
+                    shutil.copy2(args.input, args.output)
+                print(f"Video saved: {args.output or args.input}")
+                return
+            embedded_salt = probe[4:20]
+            master_key, _ = crypto.password_to_key(args.password, embedded_salt)
+        elif key_mode == "std":
+            master_key = _resolve_key(args)
+        else:
+            # No recognizable content — output normal video
+            if args.output:
+                shutil.copy2(args.input, args.output)
+            print(f"Video saved: {args.output or args.input}")
+            return
 
         found = False
         msg_text = None
@@ -239,17 +292,25 @@ def cmd_decode(args):
             img = video.load_frame(ff)
             payload = stego.extract(img, cap)
 
-            if payload[:4] != MAGIC:
+            # Determine offset based on magic type
+            if payload[:4] == MAGIC_PWD:
+                # "ENP1" + salt(16) + type(1) + ...
+                data_offset = 20  # 4 magic + 16 salt
+            elif payload[:4] == MAGIC:
+                # "ENG1" + type(1) + ...
+                data_offset = 4
+            else:
                 continue
 
-            stype = chr(payload[4])
+            stype = chr(payload[data_offset])
             frame_key = crypto.derive_frame_key(master_key, fi)
 
             if stype == "T":
                 try:
-                    text_len = struct.unpack(">H", payload[5:7])[0]
-                    enc_len = struct.unpack(">I", payload[7:11])[0]
-                    enc_data = payload[11:11 + enc_len]
+                    o = data_offset + 1
+                    text_len = struct.unpack(">H", payload[o:o+2])[0]
+                    enc_len = struct.unpack(">I", payload[o+2:o+6])[0]
+                    enc_data = payload[o+6:o+6 + enc_len]
                     dec = crypto.decrypt(enc_data, frame_key)
                     msg_text = dec[:text_len].decode("utf-8")
                     found = True
@@ -259,9 +320,13 @@ def cmd_decode(args):
 
             elif stype == "V":
                 try:
-                    _, _, sw, sh, total, idx = struct.unpack(">4sBHHII", payload[:17])
-                    enc_len = struct.unpack(">I", payload[17:21])[0]
-                    enc_data = payload[21:21 + enc_len]
+                    o = data_offset + 1
+                    sw = struct.unpack(">H", payload[o:o+2])[0]
+                    sh = struct.unpack(">H", payload[o+2:o+4])[0]
+                    total = struct.unpack(">I", payload[o+4:o+8])[0]
+                    idx = struct.unpack(">I", payload[o+8:o+12])[0]
+                    enc_len = struct.unpack(">I", payload[o+12:o+16])[0]
+                    enc_data = payload[o+16:o+16 + enc_len]
                     dec = crypto.decrypt(enc_data, frame_key)
                     frame = np.frombuffer(dec, dtype=np.uint8).reshape((sh, sw, 3))
                     video.save_frame(frame, os.path.join(sec_dir, f"frame_{idx:06d}.png"))
@@ -320,11 +385,7 @@ def cmd_info(args):
 
 
 def _resolve_key(args) -> bytes:
-    """Resolve encryption key from CLI arguments."""
-    if hasattr(args, "password") and args.password:
-        key, _ = crypto.password_to_key(args.password)
-        return key
-
+    """Resolve encryption key from CLI arguments (non-password modes)."""
     if hasattr(args, "video_key") and args.video_key:
         return video.video_to_key(args.video_key)
 

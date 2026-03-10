@@ -60,14 +60,17 @@ Input:
   key (password, video-as-key, or X25519 identity)
 
 Process:
-  1. Resolve key → 256-bit master_key
-  2. Extract all frames as PNG (FFmpeg)
+  1. Extract all frames as PNG (FFmpeg)
+  2. Probe first frame for magic bytes:
+     a. "ENP1" → password mode: extract salt from bytes 4-20, derive key via scrypt(password, salt)
+     b. "ENG1" → standard mode: resolve key via keypair or video-key
   3. For each frame:
      a. Extract LSB payload (full frame capacity)
-     b. Check for MAGIC bytes "ENG1"
-     c. If found: derive frame_key, decrypt payload
-     d. If text: print message
-     e. If video: save decoded frame
+     b. Derive frame_key = HKDF(master_key, frame_index)
+     c. Parse header fields at correct offset (4 for ENG1, 20 for ENP1)
+     d. Decrypt payload with frame_key
+     e. If text: print message
+     f. If video: save decoded frame
   4. If video frames found: assemble into MKV (FFmpeg)
   5. If nothing found: output the video as-is (no hint)
 
@@ -82,7 +85,9 @@ Output:
 
 ```
 Password Mode:
-  password → scrypt(n=16384, r=8, p=1) → 256-bit key
+  password + salt(16 bytes) → scrypt(n=16384, r=8, p=1) → 256-bit key
+  Salt is generated randomly during encoding and embedded in the ENP1 payload header.
+  During decoding, salt is extracted from the payload before key derivation.
 
 Video-as-Key Mode:
   video file → extract 5 frames → resize to 64x64 → SHA-256(pixel_data + first_1MB) → 256-bit key
@@ -140,6 +145,10 @@ Example (720p, 30fps, 60 seconds):
 
 ### Payload Format
 
+Two payload formats exist, distinguished by magic bytes:
+
+**Keypair/Video-key mode — MAGIC "ENG1":**
+
 ```
 Byte offset  Size     Field
 ──────────────────────────────────
@@ -159,6 +168,31 @@ For video (Type = 'V'):
 17           4        Encrypted data length (uint32 BE)
 21           N        Encrypted data
 ```
+
+**Password mode — MAGIC "ENP1":**
+
+```
+Byte offset  Size     Field
+──────────────────────────────────
+0            4        Magic ("ENP1")
+4            16       Scrypt salt (random, generated at encode time)
+20           1        Type ('T' = text, 'V' = video)
+
+For text (Type = 'T'):
+21           2        Text length (uint16 BE)
+23           4        Encrypted data length (uint32 BE)
+27           N        Encrypted data
+
+For video (Type = 'V'):
+21           2        Secret width (uint16 BE)
+23           2        Secret height (uint16 BE)
+25           4        Total secret frames (uint32 BE)
+29           4        Current frame index (uint32 BE)
+33           4        Encrypted data length (uint32 BE)
+37           N        Encrypted data
+```
+
+The decoder checks bytes 0-3 to determine the format. Data field offsets are 4 (ENG1) or 20 (ENP1).
 
 ## Key Storage
 
