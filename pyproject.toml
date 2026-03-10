@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engare"
+version = "0.1.0"
+description = "Hide encrypted videos inside normal videos. Only the intended eyes shall see."
+readme = "README.md"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Engare Contributors"}
+]
+keywords = ["steganography", "encryption", "video", "privacy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "cryptography>=42.0",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+engare = "engare.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Ludaxis/engare"
+Issues = "https://github.com/Ludaxis/engare/issues"
+
+[tool.setuptools.packages.find]
+include = ["engare*"]
