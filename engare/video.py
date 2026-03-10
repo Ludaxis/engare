@@ -83,8 +83,13 @@ def extract_audio(path: str, output: str) -> bool:
     return r.returncode == 0 and os.path.exists(output)
 
 
-def build_video(frames_dir: str, output: str, fps: float, audio: str | None = None):
-    """Reconstruct video from frames using lossless FFV1 codec."""
+def build_video(frames_dir: str, output: str, fps: float,
+                audio: str | None = None, codec: str = "ffv1"):
+    """Reconstruct video from frames using a lossless codec.
+
+    codec: "ffv1" (default, MKV) or "h264" (H.264 lossless RGB, smaller files).
+    Both are bit-exact in RGB — steganographic data survives the roundtrip.
+    """
     cmd = [
         "ffmpeg", "-y",
         "-framerate", str(fps),
@@ -92,14 +97,87 @@ def build_video(frames_dir: str, output: str, fps: float, audio: str | None = No
     ]
     if audio and os.path.exists(audio):
         cmd += ["-i", audio, "-c:a", "aac", "-b:a", "128k"]
-    cmd += [
-        "-c:v", "ffv1",       # Lossless — preserves every bit
-        "-level", "3",
-        "-pix_fmt", "rgb24",
-        "-shortest",
-        str(output),
-    ]
+
+    if codec == "h264":
+        cmd += [
+            "-c:v", "libx264rgb",  # H.264 in RGB colorspace — no YUV conversion loss
+            "-crf", "0",           # Mathematically lossless
+            "-preset", "ultrafast",
+            "-pix_fmt", "rgb24",
+        ]
+    else:  # ffv1
+        cmd += [
+            "-c:v", "ffv1",
+            "-level", "3",
+            "-pix_fmt", "rgb24",
+        ]
+
+    cmd += ["-shortest", str(output)]
     subprocess.run(cmd, capture_output=True)
+
+
+def read_frames(path: str) -> tuple[list[np.ndarray], dict]:
+    """Read all frames from video via FFmpeg pipe (no disk I/O).
+
+    Returns (list of RGB numpy arrays, video info dict).
+    """
+    check_ffmpeg()
+    info = get_info(path)
+    w, h = info["width"], info["height"]
+    frame_size = w * h * 3
+
+    proc = subprocess.Popen(
+        ["ffmpeg", "-i", str(path), "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-v", "quiet", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+    frames = []
+    while True:
+        raw = proc.stdout.read(frame_size)
+        if len(raw) < frame_size:
+            break
+        frames.append(np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy())
+
+    proc.wait()
+    return frames, info
+
+
+def write_frames(frames: list[np.ndarray], output: str, fps: float,
+                 codec: str = "ffv1", audio: str | None = None):
+    """Write frames to video via FFmpeg pipe (no disk I/O).
+
+    frames: list of RGB numpy arrays (all same shape)
+    """
+    check_ffmpeg()
+    if not frames:
+        return
+
+    h, w = frames[0].shape[:2]
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{w}x{h}", "-r", str(fps),
+        "-i", "pipe:0",
+    ]
+    if audio and os.path.exists(audio):
+        cmd += ["-i", audio, "-c:a", "aac", "-b:a", "128k"]
+
+    if codec == "h264":
+        cmd += ["-c:v", "libx264rgb", "-crf", "0", "-preset", "ultrafast",
+                "-pix_fmt", "rgb24"]
+    else:
+        cmd += ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "rgb24"]
+
+    cmd += ["-shortest", str(output)]
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    for frame in frames:
+        proc.stdin.write(frame.astype(np.uint8).tobytes())
+    proc.stdin.close()
+    proc.wait()
 
 
 def load_frame(path: str) -> np.ndarray:

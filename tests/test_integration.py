@@ -291,3 +291,97 @@ class TestSaltEmbedding:
         enc_data = extracted[o+7:o+7 + enc_len]
         dec = crypto.decrypt(enc_data, frame_key2)
         assert dec[:len(message)] == message
+
+
+@needs_ffmpeg
+class TestH264LosslessRoundtrip:
+    """Verify H.264 lossless (libx264rgb) preserves steganographic data."""
+
+    def test_roundtrip(self):
+        tmpdir = tempfile.mkdtemp(prefix="engare_test_")
+        try:
+            from engare import video
+
+            # Check if libx264rgb is available
+            import subprocess
+            r = subprocess.run(["ffmpeg", "-codecs"], capture_output=True, text=True)
+            if "libx264rgb" not in r.stdout:
+                pytest.skip("libx264rgb not available in this FFmpeg build")
+
+            # Create stego frame with embedded data
+            frame = np.random.randint(0, 256, (128, 128, 3), dtype=np.uint8)
+            cap = stego.capacity(128, 128)
+
+            password = "h264-test"
+            key, salt = crypto.password_to_key(password)
+            message = b"H.264 lossless roundtrip test"
+            frame_key = crypto.derive_frame_key(key, 0)
+            encrypted = crypto.encrypt(message, frame_key)
+
+            magic_header = MAGIC_PWD + salt
+            header = magic_header + struct.pack(">BH", ord("T"), len(message))
+            payload = header + struct.pack(">I", len(encrypted)) + encrypted
+            payload += b"\x00" * (cap - len(payload))
+
+            stego_frame = stego.embed(frame, payload)
+
+            # Save as PNG, build H.264 video, extract back
+            stego_dir = os.path.join(tmpdir, "stego_frames")
+            os.makedirs(stego_dir)
+            video.save_frame(stego_frame, os.path.join(stego_dir, "frame_000000.png"))
+
+            h264_out = os.path.join(tmpdir, "stego.mp4")
+            video.build_video(stego_dir, h264_out, 10, codec="h264")
+            assert os.path.exists(h264_out)
+
+            # Also build FFV1 for size comparison
+            ffv1_out = os.path.join(tmpdir, "stego.mkv")
+            video.build_video(stego_dir, ffv1_out, 10, codec="ffv1")
+            h264_size = os.path.getsize(h264_out)
+            ffv1_size = os.path.getsize(ffv1_out)
+            assert h264_size < ffv1_size, "H.264 should be smaller than FFV1"
+
+            # Extract frame from H.264 and verify data survives
+            dec_dir = os.path.join(tmpdir, "dec_frames")
+            video.extract_frames(h264_out, dec_dir)
+            dec_frame = video.load_frame(os.path.join(dec_dir, "frame_000000.png"))
+            extracted = stego.extract(dec_frame, cap)
+
+            assert extracted[:4] == MAGIC_PWD
+            embedded_salt = extracted[4:20]
+            assert embedded_salt == salt
+
+            key2, _ = crypto.password_to_key(password, embedded_salt)
+            frame_key2 = crypto.derive_frame_key(key2, 0)
+            o = 20
+            enc_len = struct.unpack(">I", extracted[o+3:o+7])[0]
+            enc_data = extracted[o+7:o+7 + enc_len]
+            dec = crypto.decrypt(enc_data, frame_key2)
+            assert dec[:len(message)] == message
+
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestStegoPerformance:
+    """Verify vectorized stego operations are fast enough."""
+
+    def test_embed_extract_speed(self):
+        import time
+
+        frame = np.random.randint(0, 256, (720, 1280, 3), dtype=np.uint8)
+        cap = stego.capacity(1280, 720)
+        data = bytes(np.random.randint(0, 256, cap, dtype=np.uint8))
+
+        start = time.perf_counter()
+        result = stego.embed(frame, data)
+        embed_ms = (time.perf_counter() - start) * 1000
+
+        start = time.perf_counter()
+        extracted = stego.extract(result, cap)
+        extract_ms = (time.perf_counter() - start) * 1000
+
+        assert extracted == data, "Roundtrip data mismatch"
+        # 720p embed should be under 200ms (vectorized), extract under 50ms
+        assert embed_ms < 200, f"Embed too slow: {embed_ms:.0f}ms"
+        assert extract_ms < 50, f"Extract too slow: {extract_ms:.0f}ms"

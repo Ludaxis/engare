@@ -33,28 +33,24 @@ def embed(cover: np.ndarray, data: bytes, bits: int = DEFAULT_BITS) -> np.ndarra
     if len(data) > max_bytes:
         raise ValueError(f"Data ({len(data)} bytes) exceeds capacity ({max_bytes} bytes)")
 
-    # Convert bytes to individual bits
-    data_bits = []
-    for byte in data:
-        for i in range(8):
-            data_bits.append((byte >> (7 - i)) & 1)
+    # Convert bytes to bit array (MSB first)
+    data_arr = np.frombuffer(data, dtype=np.uint8)
+    data_bits = np.unpackbits(data_arr)
 
     # Pad to align with bits-per-channel
-    while len(data_bits) % bits:
-        data_bits.append(0)
+    pad = (-len(data_bits)) % bits
+    if pad:
+        data_bits = np.concatenate([data_bits, np.zeros(pad, dtype=np.uint8)])
 
-    # Clear LSBs and embed data
-    mask = (0xFF << bits) & 0xFF
-    bi = 0
-    for i in range(len(flat)):
-        if bi >= len(data_bits):
-            break
-        v = int(flat[i]) & mask
-        for b in range(bits):
-            if bi < len(data_bits):
-                v |= data_bits[bi] << (bits - 1 - b)
-                bi += 1
-        flat[i] = v
+    # Group bits and compute the value to embed per channel
+    num_channels = len(data_bits) // bits
+    bit_groups = data_bits.reshape(-1, bits)
+    multipliers = (1 << np.arange(bits - 1, -1, -1)).astype(np.uint8)
+    data_values = (bit_groups * multipliers).sum(axis=1).astype(np.uint8)
+
+    # Clear LSBs and embed
+    mask = np.uint8((0xFF << bits) & 0xFF)
+    flat[:num_channels] = (flat[:num_channels] & mask) | data_values
 
     return flat.reshape(cover.shape)
 
@@ -67,22 +63,23 @@ def extract(stego: np.ndarray, length: int, bits: int = DEFAULT_BITS) -> bytes:
     length: number of bytes to extract
     bits:   bits per channel used during embedding
     """
-    flat = stego.flatten()
+    flat = stego.flatten().astype(np.uint8)
     needed_bits = length * 8
+    needed_channels = (needed_bits + bits - 1) // bits
+    pixel_values = flat[:needed_channels]
 
-    data_bits = []
-    for i in range(len(flat)):
-        if len(data_bits) >= needed_bits:
-            break
-        for b in range(bits):
-            data_bits.append((int(flat[i]) >> (bits - 1 - b)) & 1)
+    # Extract bit planes from LSBs
+    bit_planes = []
+    for b in range(bits):
+        shift = bits - 1 - b
+        bit_planes.append((pixel_values >> shift) & 1)
 
-    # Convert bits back to bytes
-    result = bytearray()
-    for i in range(0, len(data_bits) - 7, 8):
-        byte = 0
-        for b in range(8):
-            byte = (byte << 1) | data_bits[i + b]
-        result.append(byte)
+    # Interleave bits from each channel and flatten
+    data_bits = np.column_stack(bit_planes).flatten()[:needed_bits]
 
-    return bytes(result[:length])
+    # Pad to byte boundary and pack
+    pad = (-len(data_bits)) % 8
+    if pad:
+        data_bits = np.concatenate([data_bits, np.zeros(pad, dtype=np.uint8)])
+
+    return bytes(np.packbits(data_bits.astype(np.uint8))[:length])
