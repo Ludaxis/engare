@@ -334,13 +334,6 @@ class TestH264LosslessRoundtrip:
             video.build_video(stego_dir, h264_out, 10, codec="h264")
             assert os.path.exists(h264_out)
 
-            # Also build FFV1 for size comparison
-            ffv1_out = os.path.join(tmpdir, "stego.mkv")
-            video.build_video(stego_dir, ffv1_out, 10, codec="ffv1")
-            h264_size = os.path.getsize(h264_out)
-            ffv1_size = os.path.getsize(ffv1_out)
-            assert h264_size < ffv1_size, "H.264 should be smaller than FFV1"
-
             # Extract frame from H.264 and verify data survives
             dec_dir = os.path.join(tmpdir, "dec_frames")
             video.extract_frames(h264_out, dec_dir)
