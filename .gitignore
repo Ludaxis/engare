@@ -1,17 +1,77 @@
+# ── Python ──
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
+*.so
+
+# ── Distribution / Packaging ──
 dist/
 build/
-.eggs/
+*.egg-info/
 *.egg
+.eggs/
+*.whl
+sdist/
+MANIFEST
+
+# ── Virtual Environments ──
 .venv/
 venv/
 env/
+ENV/
+
+# ── Testing ──
 .pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ── Type Checking / Linting ──
 .mypy_cache/
-*.mkv
+.ruff_cache/
+.pytype/
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Video Files (never commit media) ──
 *.mp4
+*.mkv
 *.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+
+# ── Audio Files ──
+*.aac
+*.mp3
+*.wav
+*.ogg
+*.flac
+
+# ── Image Files (frames / test output) ──
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.tiff
+
+# ── Engare Key Files (never commit private keys) ──
 .engare/
+*.key
+
+# ── Temp / OS ──
+*.tmp
+*.bak
+*.log
+tmp/
+temp/
